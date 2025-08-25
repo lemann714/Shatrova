@@ -1,0 +1,7 @@
+2025-08-26 00:14:00,104 INFO [load_multiple_csv] 11 files → 30729833 rows
+2025-08-26 00:15:30,103 INFO 
+=== IsolationForest GridSearch ===
+2025-08-26 00:15:30,104 INFO Best score (neg‑mean‑score_samples): 0.488329
+2025-08-26 00:15:30,104 INFO Best params: {'iso__contamination': 0.001, 'iso__max_samples': 'auto', 'iso__n_estimators': 600}
+2025-08-26 00:15:35,179 INFO 
+--- LSTM‑AE cfg: {'latent_dim': 64, 'batch_size': 64, 'lr': 0.001, 'epochs': 10}
