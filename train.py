@@ -10,15 +10,19 @@ import pandas as pd
 from collections import deque
 from scipy.stats import kurtosis
 from scipy.fft import rfft, rfftfreq
+from itertools import product
+from tqdm import tqdm  
+from math import prod             
 
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from torch.cuda.amp import autocast, GradScaler
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import re
 import random
 
@@ -35,18 +39,24 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__) 
-
+amp_scaler = GradScaler()          # ← отдельный объект, НЕ переопределяется
 RANDOM_SEED = 42                     # единственное место, где меняем seed
 
 def set_global_seed(seed: int = RANDOM_SEED) -> None:
-    """Устанавливает детерминированный seed для Python, NumPy, PyTorch и CUDA."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)          # если есть несколько GPU
-    # Делаем операции CuDNN детерминированными (цена – небольшое падение скорости)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # CuDNN flags – выбираем один из режимов
+    if DEVICE.type == "cuda":
+        torch.backends.cudnn.deterministic = True   # воспроизводимость
+        torch.backends.cudnn.benchmark = False     # отключаем автоподбор
+    else:
+        # На CPU эти флаги не имеют смысла
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = False
 
 
 # ------------------- параметры измерения -----------------------
@@ -240,26 +250,35 @@ def predict_isolation_forest(test_path: pathlib.Path,
         "iso_raw": raw,
     })
 
-
-# --------------------------------------------------------------
-# LSTM-AutoEncoder
-# --------------------------------------------------------------
 class CurrentsDataset(Dataset):
-    """
-    Принимает массив (n, 3, win) → (n, win, 3) и хранит его как обычный torch-тензор.
-    Используем `torch.tensor`, а не `torch.from_numpy`, чтобы избавиться от зависимости от
-    «numpy-support» в сборке PyTorch.
-    """
+    """(n, 3, win) → (n, win, 3) без копирования."""
     def __init__(self, windows: np.ndarray):
         # windows: (n, 3, win) → (n, win, 3)
         arr = np.transpose(windows, (0, 2, 1))
-        self.x = torch.tensor(arr, dtype=torch.float32)
+        self.x = torch.from_numpy(arr).float()   # без копии
 
     def __len__(self):
         return self.x.shape[0]
 
     def __getitem__(self, idx):
         return self.x[idx]
+# --------------------------------------------------------------
+# LSTM-AutoEncoder
+# --------------------------------------------------------------
+class LazyWindowsDataset(Dataset):
+    def __init__(self, arr: np.ndarray, scaler: StandardScaler):
+        self.arr = arr.astype(np.float32)          # (N, 3)
+        self.scaler = scaler
+        self.n_samples = (len(self.arr) - WINDOW_SIZE) // STEP_SIZE + 1
+
+    def __len__(self) -> int:
+        return self.n_samples
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        start = idx * STEP_SIZE
+        win = self.arr[start:start + WINDOW_SIZE]          # (win, 3)
+        win = self.scaler.transform(win)                   # (win, 3)
+        return torch.from_numpy(win)                         # (win, 3)
 
 
 class LSTMAutoEncoder(nn.Module):
@@ -288,72 +307,77 @@ class LSTMAutoEncoder(nn.Module):
         out, _ = self.decoder(latent)
         return out
 
-
 def grid_search_lstm_ae(df: pd.DataFrame,
-                        param_grid: dict = None) -> tuple:
+                        param_grid: dict | None = None,
+                        patience: int = 2,
+                        num_workers: int = 0) -> tuple:
     """
-    Простейший перебор гиперпараметров LSTM-AE.
-    Возвращает (final_model, scaler_all, best_cfg, best_val_mse)
+    Перебор гиперпараметров LSTM‑AE.
+    Возвращает (final_model, feat_scaler, best_cfg, best_score)
     """
     if param_grid is None:
         param_grid = {
             "latent_dim": [64, 128],
             "batch_size": [64, 128],
             "lr": [5e-4, 1e-4],
-            "epochs": [8, 12],
+            "epochs": [5, 10],
         }
 
-    windows = make_dataset(df)
+    # ---------- 1️⃣  скейлер признаков ----------
+    raw_arr = df[["current_R", "current_S", "current_T"]].values.astype(np.float32)
+    sample_n = min(100_000, len(raw_arr))
+    sample_idx = np.random.choice(len(raw_arr), size=sample_n, replace=False)
+    feat_scaler = StandardScaler()
+    feat_scaler.fit(raw_arr[sample_idx])
 
-    # фиксируем одинаковый split для всех конфигураций
-    n_total = windows.shape[0]
-    idx = np.arange(n_total)
-    np.random.shuffle(idx)
-    split = int(0.8 * n_total)
-    train_idx, val_idx = idx[:split], idx[split:]
-    windows_train, windows_val = windows[train_idx], windows[val_idx]
+    # ---------- 2️⃣  датасет ----------
+    full_dataset = LazyWindowsDataset(raw_arr, feat_scaler)
+
+    # ---------- 3️⃣  разбиение ----------
+    indices = np.arange(len(full_dataset))
+    np.random.shuffle(indices)
+    split = int(0.85 * len(full_dataset))
+    train_idx, val_idx = indices[:split], indices[split:]
+
+    train_set = Subset(full_dataset, train_idx)
+    val_set   = Subset(full_dataset, val_idx)
+
+    # ---------- 4️⃣  перебор конфигураций ----------
+    keys, values = zip(*param_grid.items())
+    total_cfg = prod([len(v) for v in values])   # без лишних списков
+    logger.info(f"[grid_search_lstm_ae] {total_cfg} конфигураций")
 
     best_score = np.inf
-    best_cfg = None
-    best_model = None
-    best_scaler = None
+    best_cfg   = None
+    best_state = None
 
-    from itertools import product
-    keys, values = zip(*param_grid.items())
-    for cfg in product(*values):
+    for cfg in tqdm(product(*values), desc="LSTM‑AE grid"):
         cfg_dict = dict(zip(keys, cfg))
-        logger.info("\n--- LSTM‑AE cfg: %s", cfg_dict)
 
-        # ---------- скейлер ----------
-        scaler = StandardScaler()
-        flat = np.transpose(windows_train, (0, 2, 1)).reshape(-1, 3)
-        flat = scaler.fit_transform(flat)
-        train_norm = flat.reshape(windows_train.shape[0],
-                                  WINDOW_SIZE, 3).transpose(0, 2, 1)
+        # DataLoader'ы – единственное, что зависит от batch_size
+        train_loader = DataLoader(
+            train_set,
+            batch_size=cfg_dict["batch_size"],
+            shuffle=True,
+            drop_last=True,
+            pin_memory=DEVICE.type == "cuda",
+            num_workers=num_workers,
+        )
+        val_loader = DataLoader(
+            val_set,
+            batch_size=cfg_dict["batch_size"],
+            shuffle=False,
+            pin_memory=DEVICE.type == "cuda",
+            num_workers=num_workers,
+        )
 
-        flat_val = np.transpose(windows_val, (0, 2, 1)).reshape(-1, 3)
-        flat_val = scaler.transform(flat_val)
-        val_norm = flat_val.reshape(windows_val.shape[0],
-                                    WINDOW_SIZE, 3).transpose(0, 2, 1)
+        # модель
+        model = LSTMAutoEncoder(
+            seq_len=WINDOW_SIZE,
+            n_features=3,
+            latent_dim=cfg_dict["latent_dim"]
+        ).to(DEVICE)
 
-        # ---------- loaders ----------
-        train_ds = CurrentsDataset(train_norm)
-        val_ds   = CurrentsDataset(val_norm)
-
-        train_loader = DataLoader(train_ds,
-                                 batch_size=cfg_dict["batch_size"],
-                                 shuffle=True, 
-                                 drop_last=True,
-                                 pin_memory=True)
-        val_loader   = DataLoader(val_ds,
-                                 batch_size=cfg_dict["batch_size"],
-                                 shuffle=False,
-                                 pin_memory=True)
-
-        # ---------- модель ----------
-        model = LSTMAutoEncoder(seq_len=WINDOW_SIZE,
-                                n_features=3,
-                                latent_dim=cfg_dict["latent_dim"]).to(DEVICE)
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg_dict["lr"])
         loss_fn   = nn.MSELoss()
 
@@ -361,60 +385,74 @@ def grid_search_lstm_ae(df: pd.DataFrame,
         for epoch in range(1, cfg_dict["epochs"] + 1):
             model.train()
             for batch in train_loader:
-                batch = batch.to(DEVICE)
+                batch = batch.to(DEVICE, non_blocking=True)
                 optimizer.zero_grad()
-                recon = model(batch)
-                loss = loss_fn(recon, batch)
-                loss.backward()
-                optimizer.step()
+                with autocast():
+                    recon = model(batch)
+                    loss = loss_fn(recon, batch)
+                amp_scaler.scale(loss).backward()
+                amp_scaler.step(optimizer)
+                amp_scaler.update()
 
-        # ---------- валидация ----------
-        model.eval()
-        val_err = []
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = batch.to(DEVICE)
-                recon = model(batch)
-                mse = ((recon - batch) ** 2).mean(dim=(1, 2))
-                val_err.append(mse.cpu().numpy())
-        val_err = np.concatenate(val_err)
-        val_score = val_err.mean()
-        logger.info(f"    Validation MSE = {val_score:.6f}")
+            # ---------- валидация ----------
+            model.eval()
+            val_err = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = batch.to(DEVICE, non_blocking=True)
+                    recon = model(batch)
+                    mse = ((recon - batch) ** 2).mean(dim=(1, 2))
+                    val_err.append(mse.cpu().numpy())
+            val_score = np.concatenate(val_err).mean()
 
-        if val_score < best_score:
-            best_score = val_score
-            best_cfg = cfg_dict
-            best_model = model
-            best_scaler = scaler
+            # ---------- early‑stop ----------
+            if val_score < best_score:
+                best_score = val_score
+                best_cfg   = cfg_dict
+                best_state = model.state_dict()
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    break
 
-    # ----------------- переобучаем лучшую конфигурацию на всём наборе ----------
-    logger.info("\n=== Лучший LSTM‑AE cfg ===")
-    logger.info("%s → val MSE %.6f", best_cfg, best_score)
+        # очистка GPU‑памяти
+        del model, optimizer, train_loader, val_loader
+        torch.cuda.empty_cache()
 
-    windows_all = make_dataset(df)
-    scaler_all = StandardScaler()
-    flat_all = np.transpose(windows_all, (0, 2, 1)).reshape(-1, 3)
-    flat_all = scaler_all.fit_transform(flat_all)
-    all_norm = flat_all.reshape(windows_all.shape[0],
-                                WINDOW_SIZE, 3).transpose(0, 2, 1)
+    # --------------------------------------------------------------
+    # 5️⃣  Финальное обучение на всём наборе (используем best_state)
+    # --------------------------------------------------------------
+    logger.info(f"\n=== Лучший cfg: {best_cfg} → val MSE {best_score:.6f}")
 
-    ds_all = CurrentsDataset(all_norm)
-    dl_all = DataLoader(ds_all,
-                        batch_size=best_cfg["batch_size"],
-                        shuffle=True, drop_last=True)
+    full_loader = DataLoader(
+        full_dataset,
+        batch_size=best_cfg["batch_size"],
+        shuffle=True,
+        drop_last=True,
+        pin_memory=DEVICE.type == "cuda",
+        num_workers=num_workers,
+        persistent_workers=False,
+    )
 
-    final_model = LSTMAutoEncoder(seq_len=WINDOW_SIZE,
-                                  n_features=3,
-                                  latent_dim=best_cfg["latent_dim"]).to(DEVICE)
-    optimizer = torch.optim.Adam(final_model.parameters(),
-                                 lr=best_cfg["lr"])
+    final_model = LSTMAutoEncoder(
+        seq_len=WINDOW_SIZE,
+        n_features=3,
+        latent_dim=best_cfg["latent_dim"]
+    ).to(DEVICE)
+
+    # Если хотите продолжить обучение от лучшего состояния:
+    if best_state is not None:
+        final_model.load_state_dict(best_state)
+
+    optimizer = torch.optim.Adam(final_model.parameters(), lr=best_cfg["lr"])
     loss_fn = nn.MSELoss()
 
     for epoch in range(1, best_cfg["epochs"] + 1):
         final_model.train()
         epoch_loss = 0.0
-        for batch in dl_all:
-            batch = batch.to(DEVICE)
+        for batch in full_loader:
+            batch = batch.to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
             recon = final_model(batch)
             loss = loss_fn(recon, batch)
@@ -422,11 +460,10 @@ def grid_search_lstm_ae(df: pd.DataFrame,
             optimizer.step()
             epoch_loss += loss.item() * batch.size(0)
         logger.info(
-            f"[final LSTM‑AE] epoch {epoch:02d} | loss {epoch_loss/len(dl_all.dataset):.6f}"
+            f"[final LSTM‑AE] epoch {epoch:02d} | loss {epoch_loss/len(full_loader.dataset):.6f}"
         )
 
-    return final_model, scaler_all, best_cfg, best_score
-
+    return final_model, feat_scaler, best_cfg, best_score
 
 def predict_lstm_ae(test_path: pathlib.Path,
                     model_dir: pathlib.Path) -> pd.DataFrame:
@@ -597,7 +634,7 @@ def train_on_folder(data_folder: pathlib.Path,
 
     # ---------- LSTM-AE ----------
     lstm_model, lstm_scaler, lstm_best, lstm_best_val = \
-        grid_search_lstm_ae(df, param_grid=lstm_grid)
+        grid_search_lstm_ae(df, param_grid=lstm_grid, num_workers=4)
 
     torch.save(lstm_model.state_dict(), model_folder / "lstm_ae.pt")
     joblib.dump(lstm_scaler, model_folder / "scaler_lstm.pkl")
